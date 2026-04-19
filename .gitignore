@@ -175,6 +175,14 @@ cython_debug/
 
 .DS_Store
 
+# Terraform (Digital Twin / infra in repo)
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+!*.tfvars.example
+.terraform.lock.hcl
+
 # Ignore Crew engineering team output
 3_crew/engineering_team/output/
 

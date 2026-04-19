@@ -1,0 +1,135 @@
+# Monorepo entrypoint — GitHub only runs workflows from the repo root.
+# A copy also lives at: 1_foundations/community_contributions/SamuelAdebodun/.github/workflows/deploy.yml
+
+name: Deploy Digital Twin
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: digital-twin-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_ROOT: 1_foundations/community_contributions/SamuelAdebodun
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.filter.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            infra:
+              - '1_foundations/community_contributions/SamuelAdebodun/infra/**'
+
+  deploy-infra:
+    needs: detect
+    if: needs.detect.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    env:
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    defaults:
+      run:
+        working-directory: ${{ env.APP_ROOT }}/infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.5
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan -input=false
+
+      - name: Terraform Apply
+        run: terraform apply -input=false tfplan
+
+  deploy-app:
+    needs: [detect, deploy-infra]
+    if: ${{ always() && (needs.deploy-infra.result == 'success' || (needs.deploy-infra.result == 'skipped' && needs.detect.outputs.infra != 'true')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build frontend (Next static export or fallback)
+        working-directory: ${{ env.APP_ROOT }}
+        run: |
+          set -e
+          if [ -f frontend/package-lock.json ] || [ -f frontend/package.json ]; then
+            cd frontend
+            npm ci
+            npm run build
+          elif [ -f package-lock.json ] || [ -f package.json ]; then
+            npm ci
+            npm run build
+          else
+            echo "No Node frontend found; writing minimal static site to ./out"
+            mkdir -p out
+            printf '%s\n' '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><title>Digital Twin</title></head><body><h1>Digital Twin</h1><p>Add a Next.js app or static files under <code>frontend/</code>.</p></body></html>' > out/index.html
+            printf '%s\n' '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><title>Not found</title></head><body><h1>404</h1></body></html>' > out/404.html
+          fi
+
+      - name: Resolve static output folder
+        id: static
+        working-directory: ${{ env.APP_ROOT }}
+        run: |
+          if [ -d out ]; then
+            echo "dir=out" >> "$GITHUB_OUTPUT"
+          elif [ -d dist ]; then
+            echo "dir=dist" >> "$GITHUB_OUTPUT"
+          elif [ -d frontend/out ]; then
+            echo "dir=frontend/out" >> "$GITHUB_OUTPUT"
+          elif [ -d frontend/dist ]; then
+            echo "dir=frontend/dist" >> "$GITHUB_OUTPUT"
+          else
+            echo "No out/ or dist/ directory after build." >&2
+            exit 1
+          fi
+
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Upload static site to '$web'
+        uses: azure/CLI@v2
+        with:
+          azcliversion: azure-cli
+          inlineScript: |
+            az storage blob upload-batch \
+              --account-name "${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}" \
+              --destination '$web' \
+              --overwrite \
+              --source "${{ github.workspace }}/${{ env.APP_ROOT }}/${{ steps.static.outputs.dir }}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies for Functions
+        working-directory: ${{ env.APP_ROOT }}/function-app
+        run: pip install -r requirements.txt
+
+      - name: Deploy Azure Functions
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTION_APP_NAME }}
+          package: ${{ env.APP_ROOT }}/function-app
